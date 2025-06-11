@@ -7,7 +7,7 @@
 #include <DallasTemperature.h>
 
 // ————————————————
-//   CONFIGURACIÓN OLED
+//   CONFIGURACIÓN OLED hghjgjhkgkj
 // ————————————————
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
