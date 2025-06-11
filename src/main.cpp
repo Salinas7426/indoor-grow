@@ -1,89 +1,98 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include "DHT.h"
 
 // ————————————————
-//   CONFIGURACIÓN OLED hghjgjhkgkj
+//   CONFIGURACIÓN LCD I²C
 // ————————————————
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 32
-#define OLED_RESET    -1
-#define OLED_ADDR     0x3C
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#define LCD_ADDR     0x27  // o 0x3F según tu módulo
+#define LCD_COLUMNS  16
+#define LCD_ROWS      2
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLUMNS, LCD_ROWS);
+
+// Define tus umbrales según calibración
+const int SOIL_DRY_THRESHOLD    = 2600;
+const int SOIL_MOIST_THRESHOLD  = 1500;
+
+// Umbrales de lectura analógica (0–4095 en ESP32)
+const int MQ135_EXCELLENT = 1000;   // Aire muy limpio
+const int MQ135_GOOD      = 2000;   // Aire aceptable
+const int MQ135_MODERATE  = 2200;   // Moderada contaminación
+const int MQ135_POOR      = 2800;   // Alta contaminación
+// >3500 → Peligroso
 
 // ————————————————
 //   PINES SENSORES/ACTUADORES
 // ————————————————
+#define VentPinOut    32
+#define VentPinIn     27
+#define oneWireBus    25
 #define DHTPIN        33
-#define DHTTYPE       DHT11
-#define ONEWIRE_PIN   25
+#define LampContPin   13
 #define CO2Pin        14
 #define HumGroundPin  26
 #define Alerta        17
-#define VentPinOut    32
-#define VentPinIn     35
-#define LampContPin   13
+
+#define DHTTYPE       DHT11
 
 DHT dht(DHTPIN, DHTTYPE);
-OneWire oneWire(ONEWIRE_PIN);
+OneWire oneWire(oneWireBus);
+String getSoilStatus(int raw);
 DallasTemperature sensors(&oneWire);
 
-// ————————————————
-//   PROTOTIPOS
-// ————————————————
-void mostrarEnOLED(const char* etiqueta, const String& valor);
+// Prototipo helper para el LCD
+void lampLoop(void *pvParams);
+String getAirQualityStatus(int raw);
+void displaySensor(const char* label, const String& value);
 
 void setup() {
+  // Inicializa serial
   Serial.begin(115200);
 
-  // Inicializar I²C en SDA=21, SCL=22
-  Wire.begin(21, 22);
+  // Inicializa I²C (bus compartido para LCD y otros dispositivos I²C)
+  Wire.begin(21, 22);  // SDA = GPIO21, SCL = GPIO22
 
-  // Iniciar OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("ERROR: OLED no encontrado");
-    while (true);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  xTaskCreatePinnedToCore(lampLoop, "Lamp Monitor", 16384, NULL, 1, NULL, 0);
 
-  // Sensores
+
+  // Inicializa LCD
+  lcd.init();
+  lcd.backlight();
+
+  // Pines de actuadores
+  pinMode(Alerta, OUTPUT);
+  pinMode(VentPinIn, OUTPUT);
+  pinMode(VentPinOut, OUTPUT);
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(LampContPin, 0);
+
+  // Inicializa sensores
   dht.begin();
   sensors.begin();
-
-  // Pines
   pinMode(CO2Pin, INPUT);
-  pinMode(HumGroundPin, INPUT);
-  pinMode(Alerta, OUTPUT);
-  pinMode(VentPinOut, OUTPUT);
-  pinMode(VentPinIn, OUTPUT);
-  ledcSetup(0, 5000, 8);         // PWM lámpara
-  ledcAttachPin(LampContPin, 0);
 }
 
 void loop() {
-  // Lecturas
-  float h       = dht.readHumidity();
-  float t       = dht.readTemperature();
+  // — Lecturas —
+  float humedad    = dht.readHumidity();
+  float temperatura= dht.readTemperature();
   sensors.requestTemperatures();
-  float tSoil   = sensors.getTempCByIndex(0);
-  int   gas     = digitalRead(CO2Pin);
-  int   humSoil = analogRead(HumGroundPin);
+  float tempSuelo  = sensors.getTempCByIndex(0);
+  int   gasState   = analogRead(CO2Pin);
+  int   humSuelo   = analogRead(HumGroundPin);
 
-  // Control alarma
-  if (!isnan(h) && !isnan(t) && (h > 80.0f || t > 24.0f)) {
+  // — Alarma —
+  if (!isnan(humedad) && !isnan(temperatura) && (humedad > 80.0 || temperatura > 24.0)) {
     digitalWrite(Alerta, HIGH);
   } else {
     digitalWrite(Alerta, LOW);
   }
 
-  // Control ventilador (ejemplo)
-  if (t > 20.0f && h > 70.0f) {
+  // — Ventilador de ejemplo —
+  if (temperatura > 20.0 && humedad > 70.0) {
     digitalWrite(VentPinOut, HIGH);
     digitalWrite(VentPinIn, HIGH);
   } else {
@@ -91,29 +100,72 @@ void loop() {
     digitalWrite(VentPinIn, LOW);
   }
 
-  // Secuencia PWM lámpara (puedes ajustar o quitar)
-  for (int i = 0; i <= 17; i++) {
-    ledcWrite(0, i);
-    delay(100);
-  }
 
-  // Despliega valores uno a uno
-  mostrarEnOLED("Humedad:",   isnan(h)      ? "ERR" : String(h,1)+"%");
-  mostrarEnOLED("Temp Aire:", isnan(t)      ? "ERR" : String(t,1)+"C");
-  mostrarEnOLED("Temp Suel:", tSoil < -50   ? "ERR" : String(tSoil,1)+"C");
-  mostrarEnOLED("Gas CO2:",   gas==LOW      ? "Detectado" : "OK");
-  mostrarEnOLED("Hum Suelo:", String(humSoil));
+
+  // — Despliega valores uno a uno en LCD —
+  displaySensor("Humedad:",   isnan(humedad)    ? "ERR" : String(humedad,1)   + "%");
+  displaySensor("Temp Aire:", isnan(temperatura)? "ERR" : String(temperatura,1)+"C");
+  displaySensor("Temp Suel:", isnan(tempSuelo)   ? "ERR" : String(tempSuelo,1)  + "C");
+  displaySensor("Gas CO2:",  getAirQualityStatus(gasState));
+  displaySensor("Hum Suel:",  getSoilStatus(humSuelo));
+
+  // Repite ciclo
 }
 
-// ————————————————
-//   DEFINICIÓN mostrarEnOLED
-// ————————————————
-void mostrarEnOLED(const char* etiqueta, const String& valor) {
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print(etiqueta);
-  display.setCursor(0, 12);
-  display.print(valor);
-  display.display();
+// — Helper para mostrar una etiqueta y su valor en la LCD — 
+void displaySensor(const char* label, const String& value) {
+  Serial.print(label);
+  Serial.println(value);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(label);
+  lcd.setCursor(0, 1);
+  lcd.print(value);
   delay(2000);
+}
+
+void lampLoop(void *pvParams){
+    // — Secuencia PWM lámpara —
+  for (int i = 0; i <= 18; i++) {
+    ledcWrite(0, i);
+    vTaskDelay(3000/portTICK_PERIOD_MS);
+  }
+  for (int i = 14; i >= 0; i--) {
+    ledcWrite(0, i);
+    vTaskDelay(3000/portTICK_PERIOD_MS);
+  }
+}
+
+// Función que devuelve "Dry", "Moist" o "Wet" según la lectura
+String getSoilStatus(int raw) {
+  Serial.println(raw);
+  if (raw < SOIL_MOIST_THRESHOLD) {
+    return "Wet";
+  } else if (raw < SOIL_DRY_THRESHOLD) {
+    return "Moist";
+  } else {
+    return "Dry";
+  }
+}
+
+String getAirQualityStatus(int raw) {
+  // int raw = analogRead(pin);         // 0–4095 en ESP32
+    Serial.println(raw);
+
+  if (raw < MQ135_EXCELLENT) {
+    return "Excelente";
+  } 
+  else if (raw < MQ135_GOOD) {
+    return "Buena";
+  } 
+  else if (raw < MQ135_MODERATE) {
+    return "Moderada";
+  } 
+  else if (raw < MQ135_POOR) {
+    return "Mala";
+  } 
+  else {
+    return "Peligrosa";
+  }
 }
